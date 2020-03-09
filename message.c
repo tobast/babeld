@@ -53,11 +53,24 @@ extern const unsigned char v4prefix[16];
 #define MAX_CHANNEL_HOPS 20
 
 /* Parse a network prefix, encoded in the somewhat baroque compressed
-   representation used by Babel.  Return the number of bytes parsed. */
+   representation used by Babel.  Return the number of bytes parsed.
+
+   Arguments:
+   * ae: the Address Encoding to be used
+   * plen: prefix length
+   * omitted: bytes omitted at the beginning of the prefix (cf _compression_)
+   * p: pointer to the first byte of the prefix representation
+   * dp: address to use for compression. The omitted bytes are taken from here.
+   * len: length of p
+   * is_hop: boolean. If !=0, the prefix to be parsed is a _hop_ address,
+     otherwise it is a source or destination address. Relevant for v6-tethered
+     routes.
+   * p_r: the parsed address (output)
+   */
 static int
 network_prefix(int ae, int plen, unsigned int omitted,
                const unsigned char *p, const unsigned char *dp,
-               unsigned int len, unsigned char *p_r)
+               unsigned int len, int is_hop, unsigned char *p_r)
 {
     unsigned pb;
     unsigned char prefix[16];
@@ -105,6 +118,26 @@ network_prefix(int ae, int plen, unsigned int omitted,
         prefix[1] = 0x80;
         if(pb > 8) memcpy(prefix + 8, p, pb - 8);
         ret = pb - 8;
+        break;
+    case 4:
+        if(is_hop) {
+            if(pb > 8 && len < pb - 8) return -1;
+            prefix[0] = 0xfe;
+            prefix[1] = 0x80;
+            if(pb > 8) memcpy(prefix + 8, p, pb - 8);
+            ret = pb - 8;
+        }
+        else {
+            if(omitted > 4 || pb > 4 || (pb > omitted && len < pb - omitted))
+                return -1;
+            memcpy(prefix, v4prefix, 12);
+            if(omitted) {
+                if(dp == NULL || !v4mapped(dp)) return -1;
+                memcpy(prefix, dp, 12 + omitted);
+            }
+            if(pb > omitted) memcpy(prefix + 12 + omitted, p, pb - omitted);
+            ret = pb - omitted;
+        }
         break;
     default:
         return -1;
@@ -167,7 +200,7 @@ parse_update_subtlv(struct interface *ifp, int metric, int ae,
                 goto fail;
             *src_plen = a[i + 2];
             rc = network_prefix(ae, *src_plen, 0, a + i + 3, NULL,
-                                len - 1, src_prefix);
+                                len - 1, 0, src_prefix);
             if(rc < 0)
                 goto fail;
             if(ae == 1)
@@ -333,7 +366,7 @@ parse_request_subtlv(int ae, const unsigned char *a, int alen,
                 goto fail;
             *src_plen = a[i + 2];
             rc = network_prefix(ae, *src_plen, 0, a + i + 3, NULL,
-                                len - 1, src_prefix);
+                                len - 1, 0, src_prefix);
             if(rc < 0)
                 goto fail;
             if(ae == 1)
@@ -381,7 +414,7 @@ parse_seqno_request_subtlv(int ae, const unsigned char *a, int alen,
                 goto fail;
             *src_plen = a[i + 2];
             rc = network_prefix(ae, *src_plen, 0, a + i + 3, NULL,
-                                len - 1, src_prefix);
+                                len - 1, 0, src_prefix);
             if(rc < 0)
                 goto fail;
             if(ae == 1)
@@ -434,9 +467,9 @@ parse_other_subtlv(const unsigned char *a, int alen)
 
 static int
 network_address(int ae, const unsigned char *a, unsigned int len,
-                unsigned char *a_r)
+                int is_hop, unsigned char *a_r)
 {
-    return network_prefix(ae, -1, 0, a, NULL, len, a_r);
+    return network_prefix(ae, -1, 0, a, NULL, len, is_hop, a_r);
 }
 
 void
@@ -573,7 +606,7 @@ parse_packet(const unsigned char *from, struct interface *ifp,
             if(len < 6) goto fail;
             DO_NTOHS(txcost, message + 4);
             DO_NTOHS(interval, message + 6);
-            rc = network_address(message[2], message + 8, len - 6, address);
+            rc = network_address(message[2], message + 8, len - 6, 0, address);
             if(rc < 0) goto fail;
             debugf("Received ihu %d (%d) from %s on %s for %s.\n",
                    txcost, interval,
@@ -616,7 +649,7 @@ parse_packet(const unsigned char *from, struct interface *ifp,
                 have_v6_nh = 0;
                 goto fail;
             }
-            rc = network_address(message[2], message + 4, len - 2,
+            rc = network_address(message[2], message + 4, len - 2, 1,
                                  nh);
             if(rc < 0) {
                 have_v4_nh = 0;
@@ -656,7 +689,7 @@ parse_packet(const unsigned char *from, struct interface *ifp,
                 rc = network_prefix(message[2], message[4], message[5],
                                     message + 12,
                                     message[2] == 1 ? v4_prefix : v6_prefix,
-                                    len - 10, prefix);
+                                    len - 10, 0, prefix);
             else
                 rc = -1;
             if(message[2] == 1) {
@@ -756,7 +789,7 @@ parse_packet(const unsigned char *from, struct interface *ifp,
             int rc, is_ss;
             if(len < 2) goto fail;
             rc = network_prefix(message[2], message[3], 0,
-                                message + 4, NULL, len - 2, prefix);
+                                message + 4, NULL, len - 2, 0, prefix);
             if(rc < 0) goto fail;
             plen = message[3] + (message[2] == 1 ? 96 : 0);
             if(message[2] == 1) {
@@ -806,7 +839,7 @@ parse_packet(const unsigned char *from, struct interface *ifp,
             if(len < 14) goto fail;
             DO_NTOHS(seqno, message + 4);
             rc = network_prefix(message[2], message[3], 0,
-                                message + 16, NULL, len - 14, prefix);
+                                message + 16, NULL, len - 14, 0, prefix);
             if(rc < 0) goto fail;
             if(message[2] == 1) {
                 v4tov6(src_prefix, zeroes);
