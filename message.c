@@ -143,7 +143,9 @@ network_prefix(int ae, int plen, unsigned int omitted,
         return -1;
     }
 
-    normalize_prefix(p_r, prefix, plen < 0 ? 128 : ae == 1 ? plen + 96 : plen);
+    normalize_prefix(p_r, prefix,
+            plen < 0 ? 128
+            : (ae == 1 || (ae == 4 && !is_hop)) ? plen + 96 : plen);
     return ret;
 }
 
@@ -688,11 +690,12 @@ parse_packet(const unsigned char *from, struct interface *ifp,
                (message[2] == 1 ? have_v4_prefix : have_v6_prefix))
                 rc = network_prefix(message[2], message[4], message[5],
                                     message + 12,
-                                    message[2] == 1 ? v4_prefix : v6_prefix,
+                                    (message[2] == 1 || message[2] == 4)
+                                        ? v4_prefix : v6_prefix,
                                     len - 10, 0, prefix);
             else
                 rc = -1;
-            if(message[2] == 1) {
+            if(message[2] == 1 || message[2] == 4) {
                 v4tov6(src_prefix, zeroes);
                 src_plen = 96;
             } else {
@@ -706,10 +709,10 @@ parse_packet(const unsigned char *from, struct interface *ifp,
             }
             parsed_len = 10 + rc;
 
-            plen = message[4] + (message[2] == 1 ? 96 : 0);
+            plen = message[4] + (message[2] == 1 || message[2] == 4 ? 96 : 0);
 
             if(message[3] & 0x80) {
-                if(message[2] == 1) {
+                if(message[2] == 1 || message[2] == 4) {
                     memcpy(v4_prefix, prefix, 16);
                     have_v4_prefix = 1;
                 } else {
@@ -718,7 +721,7 @@ parse_packet(const unsigned char *from, struct interface *ifp,
                 }
             }
             if(message[3] & 0x40) {
-                if(message[2] == 1) {
+                if(message[2] == 1 || message[2] == 4) {
                     memset(router_id, 0, 4);
                     memcpy(router_id + 4, prefix + 12, 4);
                 } else {
@@ -736,9 +739,12 @@ parse_packet(const unsigned char *from, struct interface *ifp,
                    format_prefix(prefix, plen),
                    format_address(from), ifp->name);
             if(message[2] == 1) {
-                if(!have_v4_nh)
+                if(!ifp->ipv4) /* Use a v6-tethered route */
+                    nh = neigh->address;
+                else if(!have_v4_nh)
                     goto fail;
-                nh = v4_nh;
+                else
+                    nh = v4_nh;
             } else if(have_v6_nh) {
                 nh = v6_nh;
             } else {
@@ -776,14 +782,9 @@ parse_packet(const unsigned char *from, struct interface *ifp,
                    is_ss ? format_prefix(src_prefix, src_plen) : "",
                    format_address(from), ifp->name);
 
-            if(message[2] == 1) {
-                if(!ifp->ipv4)
-                    goto done;
-            }
-
-            update_route(router_id, prefix, plen, src_prefix, src_plen, seqno,
-                         metric, interval, neigh, nh,
-                         channels, channels_len);
+            update_route(router_id, prefix, plen, src_prefix, src_plen,
+                    seqno, metric, interval, neigh, nh,
+                    channels, channels_len);
         } else if(type == MESSAGE_REQUEST) {
             unsigned char prefix[16], src_prefix[16], plen, src_plen;
             int rc, is_ss;
@@ -1153,7 +1154,7 @@ really_buffer_update(struct buffered *buf, struct interface *ifp,
                      unsigned char *channels, int channels_len)
 {
     int add_metric, v4, real_plen, real_src_plen;
-    int omit, spb, channels_size, len;
+    int ae, omit, spb, channels_size, len;
     const unsigned char *real_prefix, *real_src_prefix;
     unsigned short flags = 0;
     int is_ss = !is_default(src_prefix, src_plen);
@@ -1177,24 +1178,32 @@ really_buffer_update(struct buffered *buf, struct interface *ifp,
     v4 = plen >= 96 && v4mapped(prefix);
 
     if(v4) {
-        if(!ifp->ipv4)
-            return;
-        omit = 0;
-        if(!buf->have_nh ||
-           memcmp(buf->nh, ifp->ipv4, 4) != 0) {
-            start_message(buf, ifp, MESSAGE_NH, 6);
-            accumulate_byte(buf, 1);
-            accumulate_byte(buf, 0);
-            accumulate_bytes(buf, ifp->ipv4, 4);
-            end_message(buf, MESSAGE_NH, 6);
-            memcpy(&buf->nh, ifp->ipv4, 4);
-            buf->have_nh = 1;
+        if(!ifp->ipv4) {
+            /* Use v6-tethered route */
+            ae = 4;
+            /* No need for a NH TLV: the NH advertised is the link-local
+               IPv6 address and Babel communicates over link-local IPv6 */
         }
+        else {
+            ae = 1;
+            if(!buf->have_nh ||
+               memcmp(buf->nh, ifp->ipv4, 4) != 0) {
+                start_message(buf, ifp, MESSAGE_NH, 6);
+                accumulate_byte(buf, 1);
+                accumulate_byte(buf, 0);
+                accumulate_bytes(buf, ifp->ipv4, 4);
+                end_message(buf, MESSAGE_NH, 6);
+                memcpy(&buf->nh, ifp->ipv4, 4);
+                buf->have_nh = 1;
+            }
+        }
+        omit = 0;
         real_prefix = prefix + 12;
         real_plen = plen - 96;
         real_src_prefix = src_prefix + 12;
         real_src_plen = src_plen - 96;
     } else {
+        ae = 2;
         omit = 0;
         if(buf->have_prefix) {
             while(omit < plen / 8 &&
@@ -1230,7 +1239,7 @@ really_buffer_update(struct buffered *buf, struct interface *ifp,
         len += 3 + spb;
 
     start_message(buf, ifp, MESSAGE_UPDATE, len);
-    accumulate_byte(buf, v4 ? 1 : 2);
+    accumulate_byte(buf, ae);
     accumulate_byte(buf, flags);
     accumulate_byte(buf, real_plen);
     accumulate_byte(buf, omit);
